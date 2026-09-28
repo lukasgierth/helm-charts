@@ -1,0 +1,93 @@
+---
+name: publish-code-server-chart
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: coder/code-server
+  CHART_PATH: ci/helm-chart
+  OCI_REPOSITORY: oci://ghcr.io/${{ github.repository_owner }}/code-server
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Latest upstream commit touching the chart
+        id: probe
+        run: |
+          sha="$(curl -fsS \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/commits?path=${CHART_PATH}&per_page=1" \
+            | jq -r '.[0].sha')"
+          if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+            echo "::error::No commits for path ${CHART_PATH} — did upstream move the chart?"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: changed
+        run: |
+          last="$(cat state/last-chart-sha 2>/dev/null || echo none)"
+          if [ "$last" != "${{ steps.probe.outputs.sha }}" ] \
+             || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "building (last published: $last)"
+          else
+            echo "chart unchanged — skipping"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.changed.outputs.changed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: main
+          path: upstream
+          fetch-depth: 1
+
+      - if: steps.changed.outputs.changed == 'true'
+        uses: azure/setup-helm@v4
+
+      - if: steps.changed.outputs.changed == 'true'
+        name: Package chart
+        run: |
+          helm lint upstream/${CHART_PATH}
+          helm package upstream/${CHART_PATH} -d dist/
+          ls -l dist/
+
+      - if: steps.changed.outputs.changed == 'true'
+        name: Push to OCI
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASS: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          host="${OCI_REPOSITORY#oci://}"
+          if [ "${host%%/*}" = "ghcr.io" ]; then
+            echo "${{ github.token }}" | helm registry login ghcr.io \
+              --username "${{ github.repository_owner }}" --password-stdin
+          elif [ -n "$REGISTRY_USER" ]; then
+            echo "$REGISTRY_PASS" | helm registry login "${host%%/*}" \
+              --username "$REGISTRY_USER" --password-stdin
+          fi
+          helm push dist/*.tgz "$OCI_REPOSITORY"
+
+      - if: steps.changed.outputs.changed == 'true'
+        name: Record published SHA
+        run: |
+          mkdir -p state
+          echo "${{ steps.probe.outputs.sha }}" > state/last-chart-sha
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/last-chart-sha
+          git commit -m "publish code-server chart @ ${{ steps.probe.outputs.sha }}"
+          git push
