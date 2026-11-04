@@ -48,7 +48,7 @@ jobs:
           fi
 
       - if: steps.changed.outputs.changed == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: main
